@@ -14,8 +14,9 @@ keywords = ["speech", "jax"]
 
 # pip dependencies of the project
 dependencies = [
-  "flax<0.7.0",
-  "last-asr==0.0.2",
+  "einops",
+  "flax>=0.7.0",
+  "last-asr==0.0.3",
   "jax",
   "optax",
 ]
@@ -27,6 +28,7 @@ dynamic = ["version"]
 # Development deps (unittest, linting, formating,...)
 # Installed through `pip install .[dev]`
 dev = [
+  "numpy",
   "pytest",
   "pytest-xdist",
   "pylint>=2.6.0",

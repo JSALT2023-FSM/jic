@@ -10,9 +10,6 @@ import last
 
 from jic import datasets
 
-# TODO
-# 1. Switch to new flax RNN API
-
 
 @dataclasses.dataclass
 class RecognitionLatticeConfig:
@@ -57,122 +54,15 @@ class RecognitionLatticeConfig:
         return lattice
 
 
-class LSTMEncoder(nn.Module):
-    """A stack of unidirectional LSTMs."""
-
+class BiLSTM(nn.Module):
     hidden_size: int
-    num_layers: int
 
     @nn.compact
-    def __call__(self, xs):
-        """Encodes the inputs.
-
-    Args:
-      xs: [batch_size, max_num_frames, feature_size] input sequences.
-
-    Returns:
-      [batch_size, max_num_frames, hidden_size] output sequences.
-    """
-        # Flax allows randomness in initializing the hidden state. However LSTM's
-        # initial hidden state is deterministic, so we just need a dummy RNG here.
-        dummy_rng = jax.random.PRNGKey(0)
-        init_carry = nn.OptimizedLSTMCell.initialize_carry(
-            rng=dummy_rng, batch_dims=xs.shape[:1], size=self.hidden_size
-        )
-        # A stack of num_layers LSTMs.
-        for _ in range(self.num_layers):
-            # nn.scan() when passed a class returns another class like object. Thus
-            # nn.scan(nn.OptimizedLSTMCell, ...)() constructs such a new instance of
-            # such a "class". Then, we invoke the __call__() method of this object
-            # by passing (init_carry, xs).
-            #
-            # The __call__() method of the nn.scan()-transformed "class" loops through
-            # the input whereas the original class takes one step.
-            _, xs = nn.scan(
-                nn.OptimizedLSTMCell,
-                variable_broadcast='params',
-                split_rngs={'params': False},
-                in_axes=1,
-                out_axes=1,
-            )()(init_carry, xs)
-        return xs
-
-
-def sequence_mask(lengths, max_length):
-    """Computes a boolean mask over sequence positions for each given length.
-
-  Example:
-  ```
-  sequence_mask([1, 2], 3)
-  [[True, False, False],
-   [True, True, False]]
-  ```
-
-  Args:
-    lengths: The length of each sequence. <int>[batch_size]
-    max_length: The width of the boolean mask. Must be >= max(lengths).
-
-  Returns:
-    A mask with shape: <bool>[batch_size, max_length] indicating which
-    positions are valid for each sequence.
-  """
-    return jnp.arange(max_length)[None] < lengths[:, None]
-
-
-@jax.vmap
-def flip_sequences(inputs, lengths):
-    """Flips a sequence of inputs along the time dimension.
-
-  This function can be used to prepare inputs for the reverse direction of a
-  bidirectional LSTM. It solves the issue that, when naively flipping multiple
-  padded sequences stored in a matrix, the first elements would be padding
-  values for those sequences that were padded. This function keeps the padding
-  at the end, while flipping the rest of the elements.
-
-  Example:
-  ```python
-  inputs = [[1, 0, 0],
-            [2, 3, 0]
-            [4, 5, 6]]
-  lengths = [1, 2, 3]
-  flip_sequences(inputs, lengths) = [[1, 0, 0],
-                                     [3, 2, 0],
-                                     [6, 5, 4]]
-  ```
-
-  Args:
-    inputs: An array of input IDs <int>[batch_size, seq_length].
-    lengths: The length of each sequence <int>[batch_size].
-
-  Returns:
-    An ndarray with the flipped inputs.
-  """
-    # Note: since this function is vmapped, the code below is effectively for
-    # a single example.
-    max_length = inputs.shape[0]
-    return jnp.flip(jnp.roll(inputs, max_length - lengths, axis=0), axis=0)
-
-
-class SimpleBiLSTM(nn.Module):
-    """A simple bi-directional LSTM."""
-    hidden_size: int
-
-    def setup(self):
-        self.forward_lstm = LSTMEncoder(self.hidden_size, 1)
-        self.backward_lstm = LSTMEncoder(self.hidden_size, 1)
-
-    def __call__(self, embedded_inputs, lengths):
-        # Forward LSTM.
-        forward_outputs = self.forward_lstm(embedded_inputs)
-
-        # Backward LSTM.
-        reversed_inputs = flip_sequences(embedded_inputs, lengths)
-        backward_outputs = self.backward_lstm(reversed_inputs)
-        backward_outputs = flip_sequences(backward_outputs, lengths)
-
-        # Concatenate the forwardand backward representations.
-        outputs = jnp.concatenate([forward_outputs, backward_outputs], -1)
-        return outputs
+    def __call__(self, frames, num_frames):
+        return nn.Bidirectional(
+            nn.RNN(nn.OptimizedLSTMCell(self.hidden_size, name='forward')),
+            nn.RNN(nn.OptimizedLSTMCell(self.hidden_size, name='backward'))
+        )(frames, seq_lengths=num_frames)
 
 
 class KeysOnlyMlpAttention(nn.Module):
@@ -233,37 +123,31 @@ class IntentClassifier(nn.Module):
     num_actions: int = len(datasets.ACTIONS)
     num_intents: int = len(datasets.INTENTS)
 
-    def setup(self):
-        self.Downstream_Encoder = SimpleBiLSTM(self.hidden_size)
-        self.second_downstream_Encoder = SimpleBiLSTM(self.hidden_size)
-        self.intents_head = nn.Dense(self.num_intents)
-        self.keys_only_mlp_attention = KeysOnlyMlpAttention(
-            2 * self.hidden_size
-        )
-        self.dropout_layer = nn.Dropout(rate=self.dropout_rate)
-        self.regrouping_head = nn.Dense(self.dense_size)
-        self.post_attention = nn.Dense(2 * self.hidden_size)
-
+    @nn.compact
     def __call__(self, full_lattice, num_frames, *, is_test):
-        regrouped_lattice = self.regrouping_head(full_lattice)
-        encoded_lattice = self.Downstream_Encoder(regrouped_lattice, num_frames)
-        encoded_lattice = self.dropout_layer(
-            encoded_lattice, deterministic=is_test
+        regrouped_lattice = nn.Dense(self.dense_size,
+                                     name='regrouping_head')(full_lattice)
+        # Encoder stack
+        encoded_lattice = BiLSTM(self.hidden_size, name='downstream_encoder_0'
+                                )(regrouped_lattice, num_frames)
+        encoded_lattice = nn.Dropout(self.dropout_rate, name='encoder_dropout'
+                                    )(encoded_lattice, deterministic=is_test)
+        encoded_lattice = BiLSTM(self.hidden_size, name='downstream_encoder_1'
+                                )(encoded_lattice, num_frames)
+        # Attention pooling
+        mask = (
+            jnp.arange(encoded_lattice.shape[-2])
+            < jnp.expand_dims(num_frames, axis=-1)
         )
-        encoded_lattice = self.second_downstream_Encoder(
-            encoded_lattice, num_frames
-        )
-        mask = sequence_mask(num_frames, encoded_lattice.shape[1])
-        attention = self.keys_only_mlp_attention(encoded_lattice, mask)
-        # Summarize the inputs by taking their weighted sum using attention scores.
-        context = jnp.expand_dims(attention, 1) @ encoded_lattice
-        context = context.squeeze(
-            1
-        )  # <float32>[batch_size, encoded_inputs_size]
-        context = self.dropout_layer(context, deterministic=is_test)
-        context = self.post_attention(context)
-
-        intents = self.intents_head(context)
+        attention = KeysOnlyMlpAttention(
+            2 * self.hidden_size, name='keys_only_mlp_attention'
+        )(encoded_lattice, mask)
+        context = jnp.einsum('BT,BTH->BH', attention, encoded_lattice)
+        context = nn.Dropout(self.dropout_rate, name='context_dropout'
+                            )(context, deterministic=is_test)
+        context = nn.Dense(2 * self.hidden_size, name='post_attention')(context)
+        # Classification
+        intents = nn.Dense(self.num_intents, name='intents_head')(context)
         return intents
 
 
