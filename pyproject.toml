@@ -14,8 +14,8 @@ keywords = ["speech", "jax"]
 
 # pip dependencies of the project
 dependencies = [
-  "flax>=0.7.0",
-  "last-asr==0.0.3",
+  "flax<0.7.0",
+  "last-asr==0.0.2",
   "jax",
   "optax",
 ]
