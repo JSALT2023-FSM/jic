@@ -105,8 +105,6 @@ class KeysOnlyMlpAttention(nn.Module):
         )  # New shape: <float32>[batch_size, seq_len].
         scores = jnp.where(mask, scores, -jnp.inf)  # Using exp(-inf) = 0 below.
         scores = nn.softmax(scores, axis=-1)
-        print(scores)
-
         # Captures the scores if 'intermediates' is mutable, otherwise does nothing.
         self.sow('intermediates', 'attention', scores)
 
@@ -155,7 +153,7 @@ class Model(nn.Module):
     lattice: last.RecognitionLattice
     classifier: IntentClassifier
 
-    def __call__(self, frames, num_frames, *, is_test):
+    def __call__(self, frames, num_frames, *, is_test=True):
         # TODO: alternative methods of computing full lattice arc weights.
         cache = self.lattice.build_cache()
         blank, lexical = self.lattice.weight_fn(cache, frames)
@@ -163,6 +161,7 @@ class Model(nn.Module):
             [jnp.expand_dims(blank, axis=-1), lexical], axis=-1
         )
         # Turn log-probs into probs.
+
         full_lattice = jnp.exp(full_lattice)
         full_lattice = einops.rearrange(full_lattice, 'B T Q V -> B T (Q V)')
         return self.classifier(full_lattice, num_frames, is_test=is_test)
