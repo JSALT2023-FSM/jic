@@ -7,7 +7,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import last
-
+from last import semirings
 from jic import datasets
 
 
@@ -152,7 +152,7 @@ class IntentClassifier(nn.Module):
 class Model(nn.Module):
     lattice: last.RecognitionLattice
     classifier: IntentClassifier
-
+    
     def __call__(self, frames, num_frames, *, is_test=True):
         # TODO: alternative methods of computing full lattice arc weights.
         cache = self.lattice.build_cache()
@@ -161,12 +161,17 @@ class Model(nn.Module):
             [jnp.expand_dims(blank, axis=-1), lexical], axis=-1
         )
         # Turn log-probs into probs.
+        shortest, alphas = self.lattice._forward(cache, frames, num_frames, semiring=semirings.Log) 
+        print(f" alphas shape : {alphas.shape}")
+        alphas = jnp.expand_dims(alphas, axis= -1)
+        alphas = jnp.repeat(alphas, 32, axis=-1)
 
-        full_lattice = jnp.exp(full_lattice)
-        # Un comment the next lign to freeze the decoder 
-        #full_lattice = jax.lax.stop_gradient(full_lattice)
-
+        embedded = nn.Embed(num_embeddings=31776, features=512)(jnp.arange(31776))
+        print(embedded.shape)
+        print(f" alphas shape : {alphas.shape}")
+        full_lattice = jnp.exp(full_lattice+ alphas)
         full_lattice = einops.rearrange(full_lattice, 'B T Q V -> B T (Q V)')
+        full_lattice = full_lattice @ embedded
         return self.classifier(full_lattice, num_frames, is_test=is_test)
 
 

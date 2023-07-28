@@ -310,7 +310,8 @@ def train_and_eval(
       print(f" {i} : {jnp.mean(jnp.array(eval_metrics[i]))}")
  
 
-model = models.Model(lattice=lattice, classifier = models.IntentClassifier())
+
+model = alpha_models.Model(lattice=lattice, classifier = models.IntentClassifier())
 step = mngr.latest_step()
 #import pdb; pdb.set_trace()
 train_and_eval(INIT_BATCH, test_dataset,dev_dataset, TRAIN_BATCHES, model, step)

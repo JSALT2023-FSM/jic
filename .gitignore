@@ -1,6 +1,5 @@
 # Compiled python modules.
 *.pyc
-
 # Byte-compiled
 _pycache__/
 .cache/
@@ -20,6 +19,8 @@ poetry.lock
 
 # Other
 *.DS_Store
+exp/first/
+exp/checkpoints/
 
 # PyCharm
 .idea
