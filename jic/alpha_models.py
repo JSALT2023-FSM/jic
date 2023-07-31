@@ -132,7 +132,7 @@ class IntentClassifier(nn.Module):
 
         #encoded_lattice = nn.Dropout(self.dropout_rate, name='encoder_dropout_1'
         #                    )(encoded_lattice, deterministic=is_test)
- 
+
         # Attention pooling
         mask = (
             jnp.arange(encoded_lattice.shape[-2])
@@ -143,10 +143,12 @@ class IntentClassifier(nn.Module):
         )(encoded_lattice, mask)
         print(attention)
         context = jnp.einsum('BT,BTH->BH', attention, encoded_lattice)
-        
+
         context = nn.Dense(2 * self.hidden_size, name='post_attention')(context)
         # Classification
-        intents = nn.Dense(self.num_intents, name='intents_head')(context)
+        intents = nn.Dense(
+            self.num_intents, use_bias=False, name='intents_head'
+        )(context)
         return intents
 
 
@@ -157,6 +159,7 @@ class Model(nn.Module):
 
     def setup(self):
         self.embedding = nn.Embed(num_embeddings=31776, features=512)
+
     def __call__(self, frames, num_frames, *, is_test=True):
         # TODO: alternative methods of computing full lattice arc weights.
         cache = self.lattice.build_cache()
@@ -165,18 +168,21 @@ class Model(nn.Module):
             [jnp.expand_dims(blank, axis=-1), lexical], axis=-1
         )
         # Turn log-probs into probs.
-        shortest, alphas = self.lattice._forward(cache, frames, num_frames, semiring=semirings.Log) 
-        alphas = jnp.expand_dims(alphas, axis= -1)
+        shortest, alphas = self.lattice._forward(
+            cache, frames, num_frames, semiring=semirings.Log
+        )
+        alphas = jnp.expand_dims(alphas, axis=-1)
         alphas = jnp.repeat(alphas, 32, axis=-1)
-        full_lattice = jnp.exp(full_lattice+alphas)
-        # Un comment the next lign to freeze the decoder 
-        if self.freeze : 
+        full_lattice = jnp.exp(full_lattice + alphas)
+        # Un comment the next lign to freeze the decoder
+        if self.freeze:
             full_lattice = jax.lax.stop_gradient(full_lattice)
         embedded = self.embedding(jnp.arange(31776))
         full_lattice = einops.rearrange(full_lattice, 'B T Q V -> B T (Q V)')
         full_lattice = full_lattice @ embedded
         print(f" alpha embedded lattice shape : {full_lattice.shape}")
         return self.classifier(full_lattice, num_frames, is_test=is_test)
+
 
 def count_number_params(params):
     return sum(
