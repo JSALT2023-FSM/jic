@@ -16,6 +16,7 @@ from jic.models import RecognitionLatticeConfig
 from tqdm import tqdm
 from utils import get_scenario_action
 from jic import models
+from jic import alpha_models
 
 import dataclasses
 # Disallow TensorFlow from using GPU so that it won't interfere with JAX.
@@ -87,7 +88,7 @@ def numpy_preprocess(wav, scenario, action, intent, ids):
   encoder_frames = np.squeeze(np.load(os.path.join(encoder_dir, wav.decode("utf-8")+".npy")))
   action_label, scenario_label, intent_label = actions_dict[action.decode("utf-8")], scen_dict[scenario.decode("utf-8")], intent_dict[intent.decode("utf-8")]
   return encoder_frames,scenario_label, action_label, intent_label, encoder_frames.shape[0], ids
-sizes =[150,250,400,600]
+sizes =[75,100,150,200,250,300,400,600]
 
 def shorten_batch(batch, sizes=sizes): 
     num_frames = tf.math.reduce_max(batch["num_frames"])
@@ -101,7 +102,7 @@ def shorten_batch(batch, sizes=sizes):
 def preprocess(
     dataset: tf.data.Dataset,
     is_train: bool ,
-    batch_size: int = 6,
+    batch_size: int = 4,
     max_num_frames: int = 600
 ) -> tf.data.Dataset:
   """Applies data preprocessing for training and evaluation."""
@@ -149,7 +150,6 @@ def create_dict(train_csvs, test= False):
 
 train_all = create_dict([train_csv, train_synthetic])
 test_all = create_dict([test_csv], test=True)
-#test_all = create_dict([train_csv, train_synthetic])
 dev_all = create_dict([dev_csv], test=True)
 train_dataset = tf.data.Dataset.from_tensor_slices(train_all)
 test_dataset = tf.data.Dataset.from_tensor_slices(test_all)
@@ -190,6 +190,7 @@ with open('/gpfsscratch/rech/nou/uzn19yk/jax_intent_classification/test_out.pick
 lattice = lattice_config.build()
 
 def count_number_params(params):
+    print(jax.tree_util.tree_map(lambda x : f' x :{x.size}',params))
     return sum(jax.tree_util.tree_leaves(jax.tree_util.tree_map(lambda x : x.size,params)))
 
 def compute_accuracies(intents, batch, loss):
@@ -212,8 +213,8 @@ def train_and_eval(
     optax.clip_by_global_norm(3.0),
     optax.scale_by_schedule(scheduler),
     optax.adam(2e-4)) , 
-    num_steps=100000,
-    num_steps_per_eval=2000,
+    num_steps=200000,
+    num_steps_per_eval=10000,
 ):
   # Initialize the model parameters using a fixed RNG seed. Flax linen Modules
   # need to know the shape and dtype of its input to initialize the parameters,
@@ -222,13 +223,18 @@ def train_and_eval(
 
   if step is None : 
       params = jax.jit(model.init)(jax.random.PRNGKey(0), INIT_BATCH["encoder_frames"], INIT_BATCH["num_frames"]).unfreeze()
+
+      #params = model.init(jax.random.PRNGKey(0), INIT_BATCH["encoder_frames"], INIT_BATCH["num_frames"]).unfreeze()
       import pprint
       print(f" number of params total : {count_number_params(params) - count_number_params(lattice_params)}")
       params["params"]["lattice"] = lattice_params["params"]
+      num_done_steps = 0
       opt_state = optimizer.init(params)
   else : 
-      params = jax.jit(model.init)(jax.random.PRNGKey(0), INIT_BATCH["encoder_frames"], INIT_BATCH["num_frames"])
-      #params = model.init(jax.random.PRNGKey(0), INIT_BATCH["encoder_frames"], INIT_BATCH["num_frames"])
+      print(f"loading step {step}")
+      num_done_steps = step
+      params = jax.jit(model.init)(jax.random.PRNGKey(0), INIT_BATCH["encoder_frames"], INIT_BATCH["num_frames"]).unfreeze()
+      #params = model.init(jax.random.PRNGKey(0), INIT_BATCH["encoder_frames"], INIT_BATCH["num_frames"]).unfreeze()
       opt_state = optimizer.init(params)
       params,opt_state = mngr.restore(step, items = [params, opt_state])
   # jax.jit compiles a JAX function to speed up execution.
@@ -266,14 +272,12 @@ def train_and_eval(
     #Compute accuracies 
     return compute_accuracies(intents, batch, test_loss)  
 
-  num_done_steps = 0
   while num_done_steps < num_steps:
     for step in tqdm(range(num_steps_per_eval), ascii=True):
       params, opt_state,train_rng, train_metrics = train_step(
           params, opt_state, train_rng, next(train_batches)
       )
 
-    mngr.save(num_done_steps,[params, opt_state])
     eval_metrics = { "intents" :[], "loss": [] }
     print("running the validation")
     for test_batch in tqdm(dev_dataset.as_numpy_iterator()) : 
@@ -283,6 +287,8 @@ def train_and_eval(
        
 
     num_done_steps += num_steps_per_eval
+
+    mngr.save(num_done_steps,[params, opt_state])
     print(f'step {num_done_steps}\ttrain {train_metrics}')
     log_file_path = os.path.join(checkpoint_dir, "log_file.txt")
     with open(log_file_path, "a") as log_file : 
@@ -301,17 +307,15 @@ def train_and_eval(
        
 
   #num_done_steps += num_steps_per_eval
-  print(f'step {num_done_steps}\ttrain {train_metrics}')
   log_file_path_test = os.path.join(checkpoint_dir, "test_log_file.txt")
   with open(log_file_path_test, "a") as log_file : 
-      log_file.write(f"step {num_done_steps}\ttrain {train_metrics} \t eval loss : {jnp.mean(jnp.concatenate(eval_metrics['loss']))} \t eval_accuracy {jnp.mean(jnp.concatenate(eval_metrics['intents']))}")
+      log_file.write(f"step {num_done_steps}\t test loss : {jnp.mean(jnp.concatenate(eval_metrics['loss']))} \t eval_accuracy {jnp.mean(jnp.concatenate(eval_metrics['intents']))}")
       log_file.write("\n")
   for i in eval_metrics : 
       print(f" {i} : {jnp.mean(jnp.array(eval_metrics[i]))}")
  
 
-
-model = alpha_models.Model(lattice=lattice, classifier = models.IntentClassifier())
+model = alpha_models.Model(lattice=lattice, classifier = models.IntentClassifier(), freeze=False)
 step = mngr.latest_step()
 #import pdb; pdb.set_trace()
 train_and_eval(INIT_BATCH, test_dataset,dev_dataset, TRAIN_BATCHES, model, step)
