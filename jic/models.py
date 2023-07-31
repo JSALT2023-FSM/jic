@@ -97,7 +97,7 @@ class KeysOnlyMlpAttention(nn.Module):
     Returns:
       The normalized attention scores. <float32>[batch_size, seq_length].
     """
-        hidden = nn.Dense(self.hidden_size, name='keys', use_bias=False)(keys)
+        hidden = nn.Dense(self.hidden_size, name='keys', use_bias=True)(keys)
         energy = nn.tanh(hidden)
         scores = nn.Dense(1, name='energy', use_bias=False)(energy)
         scores = scores.squeeze(
@@ -113,9 +113,9 @@ class KeysOnlyMlpAttention(nn.Module):
 
 class IntentClassifier(nn.Module):
     # Size for encoder LSTMs, the output context LSTM, the joint weight function.
+    dense_size = 512
     hidden_size: int = 768
-    dropout_rate = 0.1
-    dense_size = 1024
+    dropout_rate = 0.15
 
     num_scenarios: int = len(datasets.SCENARIOS)
     num_actions: int = len(datasets.ACTIONS)
@@ -123,8 +123,9 @@ class IntentClassifier(nn.Module):
 
     @nn.compact
     def __call__(self, full_lattice, num_frames, *, is_test):
-        regrouped_lattice = nn.Dense(self.dense_size,
-                                     name='regrouping_head')(full_lattice)
+        regrouped_lattice = nn.Dense(
+            self.dense_size, name='regrouping_head', use_bias=False
+        )(full_lattice)
         # Encoder stack
         encoded_lattice = BiLSTM(self.hidden_size, name='downstream_encoder_0'
                                 )(regrouped_lattice, num_frames)
@@ -141,33 +142,42 @@ class IntentClassifier(nn.Module):
             2 * self.hidden_size, name='keys_only_mlp_attention'
         )(encoded_lattice, mask)
         context = jnp.einsum('BT,BTH->BH', attention, encoded_lattice)
-        context = nn.Dropout(self.dropout_rate, name='context_dropout'
-                            )(context, deterministic=is_test)
         context = nn.Dense(2 * self.hidden_size, name='post_attention')(context)
         # Classification
-        intents = nn.Dense(self.num_intents, name='intents_head')(context)
+        intents = nn.Dense(
+            self.num_intents, use_bias=False, name='intents_head'
+        )(context)
         return intents
 
 
 class Model(nn.Module):
     lattice: last.RecognitionLattice
     classifier: IntentClassifier
+    use_arc_marginals: bool = False
+    stop_grad_on_lattice: bool = False
 
     def __call__(self, frames, num_frames, *, is_test=True):
-        # TODO: alternative methods of computing full lattice arc weights.
+        full_lattice = self.build_lattice(frames, num_frames)
+        # Flatten the (state, vocab) dimensions.
+        full_lattice = einops.rearrange(full_lattice, 'B T Q V -> B T (Q V)')
+        if self.stop_grad_on_lattice:
+            full_lattice = jax.lax.stop_gradient(full_lattice)
+        return self.classifier(full_lattice, num_frames, is_test=is_test)
+
+    def build_lattice(self, frames, num_frames):
         cache = self.lattice.build_cache()
         blank, lexical = self.lattice.weight_fn(cache, frames)
         full_lattice = jnp.concatenate(
             [jnp.expand_dims(blank, axis=-1), lexical], axis=-1
         )
+        if self.use_arc_marginals:
+            _, alphas = self.lattice._forward(
+                cache, frames, num_frames, semiring=last.semirings.Log
+            )
+            full_lattice = full_lattice + jnp.expand_dims(alphas, axis=-1)
         # Turn log-probs into probs.
-
         full_lattice = jnp.exp(full_lattice)
-        # Un comment the next lign to freeze the decoder 
-        #full_lattice = jax.lax.stop_gradient(full_lattice)
-
-        full_lattice = einops.rearrange(full_lattice, 'B T Q V -> B T (Q V)')
-        return self.classifier(full_lattice, num_frames, is_test=is_test)
+        return full_lattice
 
 
 def count_number_params(params):
